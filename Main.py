@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -12,21 +11,15 @@ from lifelines.utils import concordance_index
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
-import time
+from huggingface_hub import login
+import timm
+from timm.data import resolve_data_config
+from timm.data.transforms_factory import create_transform
+import random
+from glob import glob
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from tqdm import tqdm
 
-data_folder = "Data"
-pan_can_folder = os.path.join(data_folder, "PanCanAtlas")
-
-gene_expr_file = os.path.join(pan_can_folder, "EBPlusPlusAdjustPANCAN_IlluminaHiSeq_RNASeqV2.geneExp.tsv")
-clinical_data_file = os.path.join(pan_can_folder, "TCGA-CDR-SupplementalTableS1.csv")
-
-start_time = time.time()
-gene_expr = pd.read_csv(gene_expr_file, sep='\t')
-print(f'Gene expression data loaded in {time.time() - start_time:.2f} seconds.')
-
-start_time = time.time()
-clinical_data = pd.read_csv(clinical_data_file)
-print(f'Clinical data loaded in {time.time() - start_time:.2f} seconds.')
 # Define file paths
 tiles_folder = 'Data/tiles'
 cache_file = 'filtered_valid_patients_cache.json'
@@ -41,56 +34,67 @@ def shorten_gene_columns(gene_expr):
     gene_expr = gene_expr.rename(columns=shortened_columns)
     return gene_expr
 
-def preprocess_gene_data(gene_expr):
-    # Apply log2(x + 1) transformation
-    gene_expr = np.log2(gene_expr + 1)
-    
-    # Normalize each gene to have zero mean and unit variance
-    gene_expr = (gene_expr - np.mean(gene_expr, axis=0)) / np.std(gene_expr, axis=0)
-    
-    return gene_expr
-
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Training on device: {device}")
 
 # Dataset class with additional features and debugging
 class MultiModalDataset(Dataset):
-    def __init__(self, clinical_data, gene_expr, transform=None):
+    def __init__(self, clinical_data, gene_expr, cache_file, transform=None):
         self.clinical_data = clinical_data
-        self.gene_expr = shorten_gene_columns(gene_expr)
-        self.transform = transform
+        self.gene_expr = self.shorten_gene_columns(gene_expr)
+        self.transform = transform if transform is not None else transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+        ])
 
-        # Ensure 'OS.time' column is present
+        # Load the cache file
+        with open(cache_file, 'r') as f:
+            self.cache = json.load(f)
+
+        # Filter clinical data to include only valid patients
+        self.clinical_data = self.clinical_data[self.clinical_data['bcr_patient_barcode'].isin(self.cache['valid_patients'])]
+
+        # Ensure 'OS.time' column is present and process it
         assert 'OS.time' in self.clinical_data.columns, "OS.time column is missing from clinical data"
-
-        # Convert 'OS.time' to numeric, replacing non-numeric values with NaN
         self.clinical_data['OS.time'] = pd.to_numeric(self.clinical_data['OS.time'], errors='coerce')
-
-        # Remove rows with NaN in 'OS.time'
         self.clinical_data = self.clinical_data.dropna(subset=['OS.time'])
 
-        # Separate numeric and categorical columns
-        num_cols = self.clinical_data.select_dtypes(include=['number']).columns
-        cat_cols = self.clinical_data.select_dtypes(exclude=['number']).columns
+        # Specify and process feature columns
+        self.feature_columns = ["age_at_initial_pathologic_diagnosis", "gender", "race", "histological_grade"]
+        self.process_feature_columns()
 
-        # Process numeric data
-        self.clinical_data[num_cols] = self.clinical_data[num_cols].fillna(self.clinical_data[num_cols].mean())
-        self.clinical_data[num_cols] = (self.clinical_data[num_cols] - self.clinical_data[num_cols].mean()) / self.clinical_data[num_cols].std()
+        self.clinical_size = len(self.feature_columns)
+        self.gene_size = gene_expr.shape[1] if len(gene_expr.shape) > 1 else gene_expr.shape[0]
 
-        # Process categorical data
-        self.label_encoders = {}
-        for col in cat_cols:
-            le = LabelEncoder()
-            self.clinical_data[col] = self.clinical_data[col].fillna('Unknown')  # Fill NaN with 'Unknown'
-            self.clinical_data[col] = le.fit_transform(self.clinical_data[col].astype(str))
-            self.label_encoders[col] = le
+        # Use the file_paths from cache instead of scanning the directory
+        self.patient_images = self.cache['image_paths']
 
-        self.clinical_size = len(self.clinical_data.columns) - 2  # Exclude 'bcr_patient_barcode' and 'OS.time'
-        self.gene_size = len(self.gene_expr.columns)
+        # Track patients without images
+        self.patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
 
         print(f"Clinical feature size: {self.clinical_size}")
         print(f"Gene feature size: {self.gene_size}")
         print(f"Final number of samples: {len(self.clinical_data)}")
+        print(f"Number of patients with images: {len(self.patient_images)}")
+
+    def shorten_gene_columns(self, gene_expr):
+        shortened_columns = {col: col[:12] for col in gene_expr.columns if col.startswith('TCGA')}
+        return gene_expr.rename(columns=shortened_columns)
+
+    def process_feature_columns(self):
+        self.encoders = {}
+        for col in self.feature_columns:
+            if col not in self.clinical_data.columns:
+                raise ValueError(f"Column {col} not found in clinical data")
+
+            if self.clinical_data[col].dtype == 'object':
+                self.clinical_data[col] = self.clinical_data[col].fillna('Unknown')
+                le = LabelEncoder()
+                self.clinical_data[col] = le.fit_transform(self.clinical_data[col].astype(str))
+                self.encoders[col] = le
+            else:
+                self.clinical_data[col] = pd.to_numeric(self.clinical_data[col], errors='coerce')
+                self.clinical_data[col] = self.clinical_data[col].fillna(self.clinical_data[col].median())
 
     def __len__(self):
         return len(self.clinical_data)
@@ -98,21 +102,29 @@ class MultiModalDataset(Dataset):
     def __getitem__(self, idx):
         patient_data = self.clinical_data.iloc[idx]
         patient_id = patient_data['bcr_patient_barcode']
+        
+        clinical_features = patient_data[self.feature_columns].values.astype(float)
+        clinical_features = np.nan_to_num(clinical_features)  # Replace NaNs with 0
 
-        clinical_features = patient_data.drop(['bcr_patient_barcode', 'OS.time']).values
-        gene_features = self.gene_expr[patient_id].values if patient_id in self.gene_expr.columns else np.zeros(self.gene_size)
+        gene_features = self.gene_expr.loc[patient_id].values if patient_id in self.gene_expr.index else np.zeros(self.gene_size)
+        gene_features = np.pad(gene_features, (0, max(0, self.gene_size - len(gene_features))))[:self.gene_size]
 
         event_times = torch.tensor(patient_data['OS.time'], dtype=torch.float)
-        censored = torch.tensor(1.0, dtype=torch.float)  # Assuming all patients are censored, adjust if you have this information
+        censored = torch.tensor(1.0, dtype=torch.float)  # Assuming all patients are censored, adjust if needed
 
-        # Load and transform image
-        image_path = os.path.join('Data/tiles', f"{patient_id}_image.jpg")  # Adjust the file name pattern as needed
-        if os.path.exists(image_path):
-            image = Image.open(image_path).convert('RGB')
-            if self.transform:
+        patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
+
+        # Load a random image for the patient
+        if patient_id in self.patient_images and self.patient_images[patient_id]:
+            image_path = random.choice(self.patient_images[patient_id])
+            try:
+                image = Image.open(image_path).convert('RGB')
                 image = self.transform(image)
+            except Exception as e:
+                print(f"Error loading image {image_path}: {str(e)}")
+                image = torch.zeros((3, 224, 224))
         else:
-            image = torch.zeros((3, 256, 256))  # Placeholder for missing images
+            image = torch.zeros((3, 224, 224))
 
         return {
             'clinical': torch.tensor(clinical_features, dtype=torch.float),
@@ -121,7 +133,11 @@ class MultiModalDataset(Dataset):
             'event_times': event_times,
             'censored': censored
         }
+    
+    def print_summary(self):
+        print(f"Number of patients without images: {len(self.patients_without_images)}")
 
+    
 class FilteringDataLoader(DataLoader):
     def __iter__(self):
         return filter(lambda x: x is not None, super().__iter__())
@@ -162,28 +178,37 @@ class GeneNet(nn.Module):
 class ImageNet(nn.Module):
     def __init__(self):
         super(ImageNet, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Flatten()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(32 * 64 * 64, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 64)  # Ensure output size is consistent
-        )
+        
+        # Login to Hugging Face
+        login(token="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")
+        
+        # Initialize UNI model
+        self.uni_model = timm.create_model("hf-hub:MahmoodLab/uni", pretrained=True, init_values=1e-5, dynamic_img_size=True)
+        self.uni_model.eval()  # Set to evaluation mode
+        
+        # Get the transform for UNI
+        config = resolve_data_config(self.uni_model.pretrained_cfg, model=self.uni_model)
+        self.transform = create_transform(**config)
+        
+        # Add a final linear layer to match the output size
+        self.fc = nn.Linear(self.uni_model.num_features, 64)
     
     def forward(self, x):
-        x = self.cnn(x)
-        return self.fc(x)
+        # Check if input is already a tensor
+        if not isinstance(x, torch.Tensor):
+            x = self.transform(x)
+        else:
+            # If it's already a tensor, just ensure it's the right shape and type
+            if x.dim() == 3:
+                x = x.unsqueeze(0)  # Add batch dimension if it's missing
+            x = x.float()  # Ensure float type
+        
+        # Get features from UNI
+        with torch.no_grad():
+            features = self.uni_model(x)
+        
+        # Pass through final linear layer
+        return self.fc(features)
 
 class MultiModalNet(nn.Module):
     def __init__(self, clinical_size, gene_size):
@@ -214,19 +239,19 @@ class SimplifiedMultiModalNet(nn.Module):
         super(SimplifiedMultiModalNet, self).__init__()
         self.clinical_fc = nn.Linear(clinical_size, 64)
         self.gene_fc = nn.Linear(gene_size, 64)
-        self.image_fc = nn.Linear(3 * 256 * 256, 64)  # Assuming 256x256 RGB images
+        self.image_net = ImageNet()  # This now uses UNI
         self.final_fc = nn.Linear(64 * 3, 1)
     
-    def forward(self, clinical, gene, image):
+    def forward(self, clinical, gene, image):        
         clinical_out = torch.relu(self.clinical_fc(clinical))
         gene_out = torch.relu(self.gene_fc(gene))
-        image_out = torch.relu(self.image_fc(image.view(image.size(0), -1)))
+        image_out = self.image_net(image)
         
         combined = torch.cat((clinical_out, gene_out, image_out), dim=1)
         output = self.final_fc(combined)
         
-        # Return both the output and the individual features
         return output, (clinical_out, gene_out, image_out)
+
 
 # Contrastive Loss Function
 class ContrastiveLoss(nn.Module):
@@ -331,7 +356,7 @@ def evaluate_model(dataloader, model, device):
         return c_index, None
 
 # Training loop with debugging and evaluation
-def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=10):
+def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=1):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     model.to(device)
@@ -383,7 +408,8 @@ transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-dataset = MultiModalDataset(clinical_data, gene_expr, transform=transform)
+dataset = MultiModalDataset(clinical_data, gene_expr, cache_file, transform=transform)
+#dataset = MultiModalDataset(clinical_data, gene_expr)
 
 # Calculate the sizes for the split
 total_size = len(dataset)
@@ -398,16 +424,15 @@ train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_worker
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
 
 # Initialize and train the model
-clinical_size = dataset.clinical_size  # Use the size from the dataset
-gene_size = dataset.gene_size  # Use the size from the dataset
+clinical_size = len(dataset.feature_columns)
+gene_size = dataset.gene_size
 
 # Use this simplified model instead of the previous MultiModalNet
-model = SimplifiedMultiModalNet(clinical_size=32, gene_size=dataset.gene_size)
+model = SimplifiedMultiModalNet(clinical_size=clinical_size, gene_size=gene_size)
 
 cox_criterion = CoxLoss()
 contrastive_criterion = ContrastiveLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.0001, momentum=0.9)
 
-train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=10)
-
-torch.save(model.state_dict(), 'histo-clinical-gene-model.pth')
+train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=1)
+dataset.print_summary()
