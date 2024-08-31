@@ -1,5 +1,7 @@
 import numpy as np
-import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import json
 import pandas as pd
 from PIL import Image
@@ -448,5 +450,5 @@ cox_criterion = CoxLoss()
 contrastive_criterion = ContrastiveLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.0001, momentum=0.9)
 
-train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=40)
+train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=20)
 dataset.print_summary()
