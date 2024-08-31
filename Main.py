@@ -1,5 +1,3 @@
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
 import os
 import json
@@ -19,6 +17,7 @@ import random
 from glob import glob
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from tqdm import tqdm
+from sklearn.model_selection import train_test_split
 
 # Define file paths
 tiles_folder = 'Data/tiles'
@@ -66,8 +65,13 @@ class MultiModalDataset(Dataset):
         self.clinical_size = len(self.feature_columns)
         self.gene_size = gene_expr.shape[1] if len(gene_expr.shape) > 1 else gene_expr.shape[0]
 
-        # Use the file_paths from cache instead of scanning the directory
-        self.patient_images = self.cache['image_paths']
+        # Process image paths
+        self.patient_images = {}
+        for idx, patient_id in enumerate(self.cache['valid_patients']):
+            if idx < len(self.cache['image_paths']):
+                self.patient_images[patient_id] = self.cache['image_paths'][idx]
+            else:
+                print(f"Warning: No image path found for patient {patient_id}")
 
         # Track patients without images
         self.patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
@@ -114,14 +118,14 @@ class MultiModalDataset(Dataset):
 
         patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
 
-        # Load a random image for the patient
-        if patient_id in self.patient_images and self.patient_images[patient_id]:
-            image_path = random.choice(self.patient_images[patient_id])
+        # Load image for the patient
+        if patient_id in self.patient_images:
+            image_path = self.patient_images[patient_id]
             try:
                 image = Image.open(image_path).convert('RGB')
                 image = self.transform(image)
             except Exception as e:
-                print(f"Error loading image {image_path}: {str(e)}")
+                print(f"Error loading image for patient {patient_id}: {str(e)}")
                 image = torch.zeros((3, 224, 224))
         else:
             image = torch.zeros((3, 224, 224))
@@ -307,56 +311,8 @@ class CoxLoss(nn.Module):
         
         return loss
 
-# Evaluation function with C-index and AUC
-def evaluate_model(dataloader, model, device):
-    model.eval()
-    all_outputs = []
-    all_event_times = []
-    all_censored = []
-    
-    with torch.no_grad():
-        for data in tqdm(dataloader, desc="Evaluating"):
-            clinical = data['clinical'].to(device)
-            gene = data['gene'].to(device)
-            image = data['image'].to(device)
-            event_times = data['event_times'].to(device)
-            censored = data['censored'].to(device)
-            
-            if clinical is None or gene is None or image is None:
-                continue
-            
-            outputs, _ = model(clinical, gene, image)
-            outputs = outputs.squeeze()
-            
-            # Ensure outputs is at least 1-dimensional
-            if outputs.dim() == 0:
-                outputs = outputs.unsqueeze(0)
-            
-            all_outputs.append(outputs)
-            all_event_times.append(event_times)
-            all_censored.append(censored)
-    
-    # Concatenate results
-    all_outputs = torch.cat(all_outputs).cpu().numpy()
-    all_event_times = torch.cat(all_event_times).cpu().numpy()
-    all_censored = torch.cat(all_censored).cpu().numpy()
-    
-    # Compute C-index
-    c_index = concordance_index(all_event_times, -all_outputs, all_censored)
-    print(f"C-index: {c_index}")
-    
-    # Compute AUC if possible
-    try:
-        # Compute AUC
-        auc = roc_auc_score(all_censored, -all_outputs)
-        print(f"AUC: {auc}")
-        return c_index, auc
-    except ValueError as e:
-        print(f"AUC Error: {e}")
-        return c_index, None
-
 # Training loop with debugging and evaluation
-def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=1):
+def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=40):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     model.to(device)
@@ -395,11 +351,58 @@ def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrast
         if torch.isnan(torch.tensor(avg_loss)):
             print("NaN loss detected. Stopping training.")
             break
-        
-        # Evaluate on test set
-        # if (epoch + 1) % 5 == 0 or epoch == epochs - 1:
-        #     c_index, auc = evaluate_model(test_loader, model, device)
-        #     print(f"Epoch {epoch + 1}/{epochs}, C-index: {c_index:.4f}, AUC: {auc:.4f}")
+    
+    # Evaluate C-index on test set after all epochs
+    c_index = evaluate_c_index(test_loader, model, device)
+    if c_index is not None:
+        print(f"Final C-index: {c_index:.4f}")
+    else:
+        print("Unable to calculate C-index")
+
+def evaluate_c_index(dataloader, model, device):
+    model.eval()
+    all_outputs = []
+    all_event_times = []
+    all_censored = []
+    
+    with torch.no_grad():
+        for data in tqdm(dataloader, desc="Evaluating"):
+            clinical = data['clinical'].to(device)
+            gene = data['gene'].to(device)
+            image = data['image'].to(device)
+            event_times = data['event_times'].to(device)
+            censored = data['censored'].to(device)
+            
+            if clinical is None or gene is None or image is None:
+                continue
+            
+            outputs, _ = model(clinical, gene, image)
+            outputs = outputs.squeeze()
+            
+            # Ensure outputs is at least 1-dimensional
+            if outputs.dim() == 0:
+                outputs = outputs.unsqueeze(0)
+            
+            all_outputs.append(outputs)
+            all_event_times.append(event_times)
+            all_censored.append(censored)
+    
+    if not all_outputs:
+        print("No valid outputs for C-index calculation")
+        return None
+
+    # Concatenate results
+    all_outputs = torch.cat(all_outputs).cpu().numpy()
+    all_event_times = torch.cat(all_event_times).cpu().numpy()
+    all_censored = torch.cat(all_censored).cpu().numpy()
+    
+    try:
+        # Compute C-index
+        c_index = concordance_index(all_event_times, -all_outputs, all_censored)
+        return c_index
+    except Exception as e:
+        print(f"Error calculating C-index: {str(e)}")
+        return None
 
 # Example usage
 # Assume clinical_data and gene_expr are pre-loaded DataFrames
@@ -409,15 +412,26 @@ transform = transforms.Compose([
 ])
 
 dataset = MultiModalDataset(clinical_data, gene_expr, cache_file, transform=transform)
-#dataset = MultiModalDataset(clinical_data, gene_expr)
+
+# Get cancer types for each patient
+cancer_types = clinical_data.set_index('bcr_patient_barcode')['type'].loc[dataset.clinical_data['bcr_patient_barcode']].values
+
+# Perform stratified split
+train_indices, test_indices = train_test_split(
+    range(len(dataset)),
+    test_size=0.15,
+    stratify=cancer_types,
+    random_state=42
+)
 
 # Calculate the sizes for the split
 total_size = len(dataset)
 train_size = int(0.85 * total_size)
 test_size = total_size - train_size
 
-# Split the dataset
-train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+# Create Subset datasets
+train_dataset = torch.utils.data.Subset(dataset, train_indices)
+test_dataset = torch.utils.data.Subset(dataset, test_indices)
 
 # Create DataLoaders
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
@@ -434,5 +448,5 @@ cox_criterion = CoxLoss()
 contrastive_criterion = ContrastiveLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.0001, momentum=0.9)
 
-train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=1)
+train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=40)
 dataset.print_summary()
