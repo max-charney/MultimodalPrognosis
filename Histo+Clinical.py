@@ -1,14 +1,9 @@
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import json
-import pandas as pd
+from torch import nn
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
 from lifelines.utils import concordance_index
-from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 from huggingface_hub import login
@@ -17,43 +12,50 @@ from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
 import random
 from glob import glob
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+import pickle
+import torch.multiprocessing as mp
+import torch.optim as optim
+import json
+import numpy as np
 
 # Define file paths
 tiles_folder = 'Data/tiles'
-cache_file = 'filtered_valid_patients_cache.json'
-
-# Shorten gene expression column names to match TCGA-XX-XXXX format
-def shorten_gene_columns(gene_expr):
-    shortened_columns = {}
-    for col in gene_expr.columns:
-        if col.startswith('TCGA'):
-            shortened_col = col[:12]
-            shortened_columns[col] = shortened_col
-    gene_expr = gene_expr.rename(columns=shortened_columns)
-    return gene_expr
+cache_file = 'patient_images_cache.json'
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Training on device: {device}")
 
 # Dataset class with additional features and debugging
 class MultiModalDataset(Dataset):
-    def __init__(self, clinical_data, gene_expr, cache_file, transform=None):
+    def __init__(self, clinical_data, cache_file, transform=None, tiles_per_patient=None, max_patients=None):
         self.clinical_data = clinical_data
-        self.gene_expr = self.shorten_gene_columns(gene_expr)
         self.transform = transform if transform is not None else transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
         ])
 
+        self.tiles_per_patient = tiles_per_patient
+        self.max_patients = max_patients
+
         # Load the cache file
         with open(cache_file, 'r') as f:
-            self.cache = json.load(f)
+            self.patient_images = json.load(f)
 
-        # Filter clinical data to include only valid patients
-        self.clinical_data = self.clinical_data[self.clinical_data['bcr_patient_barcode'].isin(self.cache['valid_patients'])]
+        # Apply tile limit if specified
+        if self.tiles_per_patient is not None:
+            self.limit_tiles_per_patient()
+
+        # Filter clinical data to include only patients with images
+        common_patients = set(clinical_data['bcr_patient_barcode']).intersection(set(self.patient_images.keys()))
+
+        # Apply max_patients filter
+        if self.max_patients is not None:
+            common_patients = list(common_patients)[:self.max_patients]
+
+        self.clinical_data = self.clinical_data[self.clinical_data['bcr_patient_barcode'].isin(common_patients)]
+
+        print(f"Number of patients with clinical and image data: {len(common_patients)}")
 
         # Ensure 'OS.time' column is present and process it
         assert 'OS.time' in self.clinical_data.columns, "OS.time column is missing from clinical data"
@@ -65,27 +67,22 @@ class MultiModalDataset(Dataset):
         self.process_feature_columns()
 
         self.clinical_size = len(self.feature_columns)
-        self.gene_size = gene_expr.shape[1] if len(gene_expr.shape) > 1 else gene_expr.shape[0]
 
-        # Process image paths
-        self.patient_images = {}
-        for idx, patient_id in enumerate(self.cache['valid_patients']):
-            if idx < len(self.cache['image_paths']):
-                self.patient_images[patient_id] = self.cache['image_paths'][idx]
-            else:
-                print(f"Warning: No image path found for patient {patient_id}")
-
-        # Track patients without images
-        self.patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
+        # Create a list of all (patient_id, image_path) pairs
+        self.all_image_paths = [(patient_id, img_path) 
+                                for patient_id, img_paths in self.patient_images.items() 
+                                for img_path in img_paths 
+                                if patient_id in self.clinical_data['bcr_patient_barcode'].values]
 
         print(f"Clinical feature size: {self.clinical_size}")
-        print(f"Gene feature size: {self.gene_size}")
-        print(f"Final number of samples: {len(self.clinical_data)}")
+        print(f"Final number of patients: {len(self.clinical_data)}")
         print(f"Number of patients with images: {len(self.patient_images)}")
+        print(f"Total number of images: {len(self.all_image_paths)}")
 
-    def shorten_gene_columns(self, gene_expr):
-        shortened_columns = {col: col[:12] for col in gene_expr.columns if col.startswith('TCGA')}
-        return gene_expr.rename(columns=shortened_columns)
+    def limit_tiles_per_patient(self):
+        for patient_id, image_paths in self.patient_images.items():
+            if len(image_paths) > self.tiles_per_patient:
+                self.patient_images[patient_id] = random.sample(image_paths, self.tiles_per_patient)
 
     def process_feature_columns(self):
         self.encoders = {}
@@ -103,52 +100,40 @@ class MultiModalDataset(Dataset):
                 self.clinical_data[col] = self.clinical_data[col].fillna(self.clinical_data[col].median())
 
     def __len__(self):
-        return len(self.clinical_data)
+        return len(self.all_image_paths)
 
     def __getitem__(self, idx):
-        patient_data = self.clinical_data.iloc[idx]
-        patient_id = patient_data['bcr_patient_barcode']
+        patient_id, image_path = self.all_image_paths[idx]
+        
+        patient_data = self.clinical_data[self.clinical_data['bcr_patient_barcode'] == patient_id].iloc[0]
         
         clinical_features = patient_data[self.feature_columns].values.astype(float)
-        clinical_features = np.nan_to_num(clinical_features)  # Replace NaNs with 0
-
-        gene_features = self.gene_expr.loc[patient_id].values if patient_id in self.gene_expr.index else np.zeros(self.gene_size)
-        gene_features = np.pad(gene_features, (0, max(0, self.gene_size - len(gene_features))))[:self.gene_size]
+        clinical_features = np.nan_to_num(clinical_features)
 
         event_times = torch.tensor(patient_data['OS.time'], dtype=torch.float)
         censored = torch.tensor(1.0, dtype=torch.float)  # Assuming all patients are censored, adjust if needed
 
-        patients_without_images = set(self.clinical_data['bcr_patient_barcode']) - set(self.patient_images.keys())
-
         # Load image for the patient
-        if patient_id in self.patient_images:
-            image_path = self.patient_images[patient_id]
-            try:
-                image = Image.open(image_path).convert('RGB')
-                image = self.transform(image)
-            except Exception as e:
-                print(f"Error loading image for patient {patient_id}: {str(e)}")
-                image = torch.zeros((3, 224, 224))
-        else:
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image = self.transform(image)
+        except Exception as e:
+            print(f"Error loading image {image_path} for patient {patient_id}: {str(e)}")
             image = torch.zeros((3, 224, 224))
 
         return {
             'clinical': torch.tensor(clinical_features, dtype=torch.float),
-            'gene': torch.tensor(gene_features, dtype=torch.float),
             'image': image,
             'event_times': event_times,
             'censored': censored
         }
-    
+
     def print_summary(self):
-        print(f"Number of patients without images: {len(self.patients_without_images)}")
+        total_images = sum(len(image_paths) for image_paths in self.patient_images.values())
+        print(f"Total number of images: {total_images}")
+        print(f"Number of patients with images: {len(self.patient_images)}")
+        print(f"Average images per patient: {total_images / len(self.patient_images):.2f}")
 
-    
-class FilteringDataLoader(DataLoader):
-    def __iter__(self):
-        return filter(lambda x: x is not None, super().__iter__())
-
-# Define the network architectures
 class ClinicalNet(nn.Module):
     def __init__(self, input_size):
         super(ClinicalNet, self).__init__()
@@ -160,22 +145,6 @@ class ClinicalNet(nn.Module):
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(128, 64)
-        )
-    
-    def forward(self, x):
-        return self.fc(x)
-
-class GeneNet(nn.Module):
-    def __init__(self, input_size):
-        super(GeneNet, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(input_size, 256),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(128, 64)  # Ensure output size is consistent
         )
     
     def forward(self, x):
@@ -217,68 +186,25 @@ class ImageNet(nn.Module):
         return self.fc(features)
 
 class MultiModalNet(nn.Module):
-    def __init__(self, clinical_size, gene_size):
+    def __init__(self, clinical_size):
         super(MultiModalNet, self).__init__()
         self.clinical_net = ClinicalNet(clinical_size)
-        self.gene_net = GeneNet(gene_size)
         self.image_net = ImageNet()
         self.fc = nn.Sequential(
-            nn.Linear(64 * 3, 1)
+            nn.Linear(64 * 2, 1)
         )
     
-    def forward(self, clinical, gene, image):
+    def forward(self, clinical, image):
         clinical_out = self.clinical_net(clinical)
-        gene_out = self.gene_net(gene)
         image_out = self.image_net(image)
         
         # Ensure all features have the same size
         feature_size = 64  # This should match the output size of each individual network
         clinical_out = clinical_out[:, :feature_size]
-        gene_out = gene_out[:, :feature_size]
         image_out = image_out[:, :feature_size]
         
-        combined = torch.cat([clinical_out, gene_out, image_out], dim=1)
-        return self.fc(combined), (clinical_out, gene_out, image_out)
-
-class SimplifiedMultiModalNet(nn.Module):
-    def __init__(self, clinical_size, gene_size):
-        super(SimplifiedMultiModalNet, self).__init__()
-        self.clinical_fc = nn.Linear(clinical_size, 64)
-        self.gene_fc = nn.Linear(gene_size, 64)
-        self.image_net = ImageNet()  # This now uses UNI
-        self.final_fc = nn.Linear(64 * 3, 1)
-    
-    def forward(self, clinical, gene, image):        
-        clinical_out = torch.relu(self.clinical_fc(clinical))
-        gene_out = torch.relu(self.gene_fc(gene))
-        image_out = self.image_net(image)
-        
-        combined = torch.cat((clinical_out, gene_out, image_out), dim=1)
-        output = self.final_fc(combined)
-        
-        return output, (clinical_out, gene_out, image_out)
-
-
-# Contrastive Loss Function
-class ContrastiveLoss(nn.Module):
-    def __init__(self, margin=0.1):
-        super(ContrastiveLoss, self).__init__()
-        self.margin = margin
-    
-    def forward(self, features):
-        clinical_features, gene_features, image_features = features
-        
-        # Compute cosine similarity
-        sim_clinical_gene = torch.nn.functional.cosine_similarity(clinical_features, gene_features, dim=1)
-        sim_clinical_image = torch.nn.functional.cosine_similarity(clinical_features, image_features, dim=1)
-        sim_gene_image = torch.nn.functional.cosine_similarity(gene_features, image_features, dim=1)
-        
-        # Compute loss
-        loss_clinical_gene = torch.clamp(self.margin - sim_clinical_gene, min=0.0)
-        loss_clinical_image = torch.clamp(self.margin - sim_clinical_image, min=0.0)
-        loss_gene_image = torch.clamp(self.margin - sim_gene_image, min=0.0)
-        
-        return loss_clinical_gene.mean() + loss_clinical_image.mean() + loss_gene_image.mean()
+        combined = torch.cat([clinical_out, image_out], dim=1)
+        return self.fc(combined), (clinical_out, image_out)
 
 class CoxLoss(nn.Module):
     def __init__(self):
@@ -313,8 +239,7 @@ class CoxLoss(nn.Module):
         
         return loss
 
-# Training loop with debugging and evaluation
-def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=40):
+def train_and_evaluate(train_loader, test_loader, model, cox_criterion, optimizer, epochs=40):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     model.to(device)
@@ -324,21 +249,17 @@ def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrast
         epoch_loss = 0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs}"):
             clinical = batch['clinical'].to(device)
-            gene = batch['gene'].to(device)
             image = batch['image'].to(device)
             event_times = batch['event_times'].to(device)
             censored = batch['censored'].to(device)
 
             optimizer.zero_grad()
-            outputs, features = model(clinical, gene, image)
+            outputs, _ = model(clinical, image)
             
-            cox_loss = cox_criterion(outputs, event_times, censored)
-            contrastive_loss = contrastive_criterion(features)
-            
-            loss = cox_loss + contrastive_loss
+            loss = cox_criterion(outputs, event_times, censored)
             
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"NaN or Inf loss detected: cox_loss={cox_loss}, contrastive_loss={contrastive_loss}")
+                print(f"NaN or Inf loss detected: loss={loss}")
                 continue
             
             loss.backward()
@@ -354,12 +275,12 @@ def train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrast
             print("NaN loss detected. Stopping training.")
             break
     
-    # Evaluate C-index on test set after all epochs
-    c_index = evaluate_c_index(test_loader, model, device)
-    if c_index is not None:
-        print(f"Final C-index: {c_index:.4f}")
-    else:
-        print("Unable to calculate C-index")
+        # Evaluate C-index on test set after batch
+        c_index = evaluate_c_index(test_loader, model, device)
+        if c_index is not None:
+            print(f"Final C-index: {c_index:.4f}")
+        else:
+            print("Unable to calculate C-index")
 
 def evaluate_c_index(dataloader, model, device):
     model.eval()
@@ -370,15 +291,14 @@ def evaluate_c_index(dataloader, model, device):
     with torch.no_grad():
         for data in tqdm(dataloader, desc="Evaluating"):
             clinical = data['clinical'].to(device)
-            gene = data['gene'].to(device)
             image = data['image'].to(device)
             event_times = data['event_times'].to(device)
             censored = data['censored'].to(device)
             
-            if clinical is None or gene is None or image is None:
+            if clinical is None or image is None:
                 continue
             
-            outputs, _ = model(clinical, gene, image)
+            outputs, _ = model(clinical, image)
             outputs = outputs.squeeze()
             
             # Ensure outputs is at least 1-dimensional
@@ -407,48 +327,54 @@ def evaluate_c_index(dataloader, model, device):
         return None
 
 # Example usage
-# Assume clinical_data and gene_expr are pre-loaded DataFrames
+# Assume clinical_data is a pre-loaded DataFrame
 transform = transforms.Compose([
-    transforms.Resize((256, 256)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
 
-dataset = MultiModalDataset(clinical_data, gene_expr, cache_file, transform=transform)
+mp.set_start_method('spawn', force=True)  # This can help with CUDA issues
 
-# Get cancer types for each patient
-cancer_types = clinical_data.set_index('bcr_patient_barcode')['type'].loc[dataset.clinical_data['bcr_patient_barcode']].values
+# Specify the number of tiles per patient (e.g., 10)
+tiles_per_patient = 40
+
+# Specify the maximum number of patients to use
+max_patients = 1000
+
+dataset = MultiModalDataset(clinical_data, 'patient_images_cache.json', transform=transform, tiles_per_patient=tiles_per_patient, max_patients=max_patients)
 
 # Perform stratified split
 train_indices, test_indices = train_test_split(
     range(len(dataset)),
     test_size=0.15,
-    stratify=cancer_types,
     random_state=42
 )
 
 # Calculate the sizes for the split
 total_size = len(dataset)
-train_size = int(0.85 * total_size)
-test_size = total_size - train_size
+train_size = len(train_indices)
+test_size = len(test_indices)
+
+print(f"Total dataset size: {total_size}")
+print(f"Training set size: {train_size}")
+print(f"Test set size: {test_size}")
 
 # Create Subset datasets
 train_dataset = torch.utils.data.Subset(dataset, train_indices)
 test_dataset = torch.utils.data.Subset(dataset, test_indices)
 
-# Create DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=0)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=0)
+# Create DataLoaders with multiple workers
+# num_workers = mp.cpu_count()  # Use all available CPU cores
+num_workers = 0
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=num_workers, pin_memory=True)
 
 # Initialize and train the model
 clinical_size = len(dataset.feature_columns)
-gene_size = dataset.gene_size
-
-# Use this simplified model instead of the previous MultiModalNet
-model = SimplifiedMultiModalNet(clinical_size=clinical_size, gene_size=gene_size)
+model = MultiModalNet(clinical_size=clinical_size)
 
 cox_criterion = CoxLoss()
-contrastive_criterion = ContrastiveLoss()
 optimizer = optim.SGD(model.parameters(), lr=0.0001, momentum=0.9)
 
-train_and_evaluate(train_loader, test_loader, model, cox_criterion, contrastive_criterion, optimizer, epochs=20)
+train_and_evaluate(train_loader, test_loader, model, cox_criterion, optimizer, epochs=40)
 dataset.print_summary()
